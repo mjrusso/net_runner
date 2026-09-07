@@ -54,16 +54,22 @@
 
 ## ADR-5: Watcher + Shepherd Dual Safety
 
-**Context**: Need to guarantee no zombies under all failure modes.
+**Context**: The shepherd handles BEAM failure. The watcher handles Process
+GenServer failure. Both can outlive the child. The kernel can reuse a numeric
+PID after the parent reaps it.
 
-**Decision**: Use both a shepherd binary (C) and a Watcher GenServer (Elixir).
+**Decision**: Send normal kill requests only through the shepherd. The watcher
+sends one direct SIGTERM only when the Process GenServer dies and the shepherd
+stops. Stop the watcher after any recorded exit status.
 
 **Consequences**:
-- (+) Shepherd covers BEAM crash (SIGKILL, OOM, segfault)
-- (+) Watcher covers GenServer crash (Elixir-level errors)
-- (+) NIF destructors provide a third layer (GC-based cleanup)
-- (-) Slightly redundant — both may try to kill the same process
-- (-) Requires careful handling of the race (both use `kill()` which is idempotent)
+- The shepherd covers BEAM failure and owns normal signaling.
+- The watcher covers a Process GenServer failure after the shepherd stops.
+- A watcher probe still uses a numeric PID. A stable process handle would
+  remove this remaining race.
+- A synthetic exit status can leave an orphan alive. Later use of its PID could
+  signal an unrelated process.
+- `kill/2` reports request transport, not signal delivery.
 
 ## ADR-6: Normal Schedulers for All NIFs
 
@@ -172,3 +178,58 @@ default argument, so there is no second definition to drift.
 Regression guard: `test/io_pipelining_test.exs`, "a saturated stdout read
 returns full-capacity chunks". Reproduce with
 `MIX_ENV=prod mix run bench/claims.exs`, section B.
+
+## ADR-10: Set the Working Directory in the Shepherd
+
+**Context**: Callers sometimes need to set a child working directory. NetRunner
+can set it through the `Port.open` `cd:` option, in the child between `fork()`
+and `exec()`, or in the shepherd before `fork()`.
+
+**Decision**: Pass `--cwd <dir>` to the shepherd. The shepherd calls `chdir()`
+after authentication and before `fork()`.
+
+**Consequences**:
+- A failed `chdir()` returns `MSG_ERROR` with `strerror(errno)` before a child
+  starts.
+- `Port.open` with `cd:` cannot report this error through the shepherd.
+- A child-side `chdir()` failure would look like an exit status from the child.
+- The selected directory controls relative paths and relative executables.
+- The shepherd also changes directory. Its later filesystem paths are absolute.
+
+## ADR-11: Pass the Environment through the Port
+
+**Context**: Callers need to change the environment that the child inherits.
+NetRunner can pass these values through the shepherd command line or through
+the `Port.open` `env:` option.
+
+**Decision**: Use the `Port.open` `env:` option. Validate each name and value in
+the BEAM.
+
+**Consequences**:
+- Environment values do not appear in the shepherd command line.
+- The shepherd and child receive the same environment. `execvp` uses its
+  `PATH` to resolve the executable.
+- A port cannot set a variable to an empty value. `""` and `nil` both remove
+  the variable.
+- Port environment entries are character lists, so names and values must be
+  valid UTF-8.
+- Invalid entries raise `ArgumentError` before NetRunner starts the shepherd.
+- An environment over the platform limit returns
+  `{:shepherd_spawn_failed, reason}`.
+
+## ADR-12: Filter Replacement Environments in the Shepherd
+
+**Context**: An overlay cannot remove inherited variables that the caller does
+not know about. Some callers need to define the complete child environment.
+
+**Decision**: Add `env: {:replace, environment}`. Pass values through the port
+environment and names through a shepherd allowlist. The shepherd removes all
+other variables before `fork()`. Untagged `env:` remains an overlay.
+
+**Consequences**:
+- Replacement mode filters the environment that the shepherd received.
+- Values use the same port transport and validation in both modes.
+- Selected names also appear in the shepherd command line.
+- Without `PATH`, the shepherd prevents `execvp` from using a default search
+  path.
+- Selected names count toward both the argument and environment size limits.

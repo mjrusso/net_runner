@@ -71,7 +71,7 @@ frame, and the BEAM verifies it before accepting any FDs.
 graph TD
     subgraph "Zombie Prevention"
         L1[Layer 1: Shepherd<br/>Detects BEAM death via POLLHUP<br/>SIGTERM → SIGKILL child]
-        L2[Layer 2: Watcher GenServer<br/>Detects Process GenServer death<br/>single SIGTERM probe via NIF — no escalation]
+        L2[Layer 2: Watcher GenServer<br/>Detects Process GenServer death<br/>single SIGTERM probe via NIF<br/>Stands down after an exit status]
         L3[Layer 3: NIF owner monitor<br/>down callback closes FDs<br/>Child sees EOF/SIGPIPE]
     end
     L1 -->|Covers| BEAM_CRASH[BEAM SIGKILL/crash]
@@ -84,23 +84,24 @@ graph TD
 | Layer | Trigger | Mechanism | Covers |
 |-------|---------|-----------|--------|
 | Shepherd | BEAM process dies | UDS POLLHUP → kill child group | BEAM SIGKILL, OOM kill, segfault |
-| Watcher | GenServer crashes | Process.monitor → one SIGTERM probe via NIF | Elixir-level crashes, unhandled errors |
+| Watcher | Process GenServer dies | Process monitor and one SIGTERM probe | GenServer failure while the child still runs |
 | NIF owner monitor | Owner process dies | `down` callback + destructor close(fd) → child SIGPIPE/EOF | Owner killed without cleanup, FD leaks |
 
-The Watcher deliberately does **not** escalate SIGTERM → SIGKILL
-(`lib/net_runner/watcher.ex`): by the time a timed escalation would fire, the
-shepherd has usually seen POLLHUP, run its own SIGTERM→SIGKILL ladder and
-*reaped* the child — a later `alive?` → `kill` from a process with no reap
-authority is a check-then-act race against OS pid reuse and can SIGKILL an
-innocent process. Escalation is the shepherd's job (Layer 1); the Watcher's
-single probe only covers a shepherd that died before its ladder ran, where
-the orphaned child's pid stays occupied (unreaped) and the probe is safe.
+The watcher does not escalate from SIGTERM to SIGKILL. The watcher stores a
+numeric PID but cannot reap the child. A delayed signal could target a process
+that reused the PID. The watcher probes once only after the Process GenServer
+and shepherd stop. A stable process handle, such as a Linux pidfd, would remove
+this race.
 
 Layer 3 is likewise not garbage collection: a NIF resource with a live
 `enif_select` registration is never destructed, so the leak safety net is the
 owner-process monitor — `io_resource_down` in `c_src/net_runner_nif.c` closes
 the fd when the owning process dies without cleaning up; the destructor only
 covers resources that were never selected on.
+
+The watcher stops after any recorded exit status. After a synthetic status,
+NetRunner cannot prove that the stored PID still identifies the child. Keeping
+the watcher active could signal a process that reused the PID.
 
 ## I/O Architecture
 
@@ -171,6 +172,35 @@ When `pty: true` is passed:
 - Single bidirectional master FD is sent via SCM_RIGHTS
 - BEAM dups the FD for independent stdin/stdout NIF resources
 - `set_window_size/3` sends `CMD_SET_WINSIZE` to shepherd, which calls `ioctl(TIOCSWINSZ)`
+
+## Working Directory
+
+The `cwd:` option has this flow:
+- BEAM accepts a non-empty binary without NUL and passes it to the shepherd as
+  `--cwd <dir>`
+- Shepherd calls `chdir()` after authentication and before `fork()`
+- A failed `chdir()` sends `MSG_ERROR` before the shepherd starts a child
+- The UDS and cgroup paths are absolute, so the directory change does not
+  affect them
+
+See ADR-10 in `decisions.md`.
+
+## Environment
+
+The `env:` option has this flow:
+- BEAM validates each name and value and passes them to the `Port.open` `env`
+  option
+- The shepherd and child inherit the resulting environment
+- The values do not appear in the shepherd command line
+- The child uses its `PATH` to resolve the executable
+- `nil` and `""` both remove a variable
+- Names and values must contain valid UTF-8
+
+Replacement mode also passes the selected names in a shepherd allowlist. After
+authentication, the shepherd removes all other variables before `fork()`. The
+BEAM environment does not change.
+
+See ADR-11 and ADR-12 in `decisions.md`.
 
 ## cgroup Support (Linux Only)
 
